@@ -3,16 +3,37 @@ const cors = require('cors');
 const connectDB = require('./config/db.js');
 require('dotenv').config();
 
+// บังคับให้เซิร์ฟเวอร์รู้จักโมเดลทั้งหมดตั้งแต่เปิดเครื่อง
+require('./models/Hospital');
+require('./models/Drug');
+require('./models/Inventory');
+require('./models/TransferRequest');
+require('./models/Delivery');
+
 const app = express();
 
+// เชื่อมต่อ MongoDB Atlas
 connectDB();
 
+// Middlewares
 app.use(cors());
-app.use(express.json());
+app.use(express.json()); // อ่าน JSON body จาก Next.js
 
+// Base Route
 app.get('/', (req, res) => {
-  res.send('Stocksync API is running...');
+    res.send('StockSync API v2 (14-Day MVP) is running...');
+});
+
+// Registering API Routes (เปิดท่อส่งข้อมูลทั้งหมด)
+app.use('/api/inventory', require('./routes/inventoryRoutes'));
+app.use('/api/ai', require('./routes/aiRoutes'));
+app.use('/api/transfers', require('./routes/transferRoutes')); // 👈 จุดที่เพิ่มล่าสุด
+
+// Error Handling Middleware พื้นฐาน (เผื่อมีอะไรพังในระบบ)
+app.use((err, req, res, next) => {
+    console.error('💥 Server Error:', err.stack);
+    res.status(500).json({ success: false, message: 'Something went wrong on the server' });
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`🚀 Server started on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 StockSync Backend started on port ${PORT}`));

@@ -1,0 +1,148 @@
+const TransferRequest = require('../models/TransferRequest');
+const mongoose = require('mongoose');
+const Inventory = require('../models/Inventory');
+const Delivery = require('../models/Delivery');
+
+// @desc    สร้างใบคำขอยืมยาใหม่ (Page 4 - New Request)
+// @route   POST /api/transfers
+const createTransferRequest = async (req, res) => {
+    try {
+        const { from_hospital, to_hospital, drug_ref, quantity_requested } = req.body;
+        
+        // ดึง ID ผู้ใช้งานที่ล็อกอินอยู่ (สมมติว่าผ่าน Auth Middleware มาแล้ว)
+        const created_by = req.user?._id || "64b5f9e2f1d2c3a4b5e6f7a8"; // ใส่ ID จำลองไว้ก่อนถ้ายังไม่ทำ Auth
+
+        // คำนวณวันกำหนดคืนอัตโนมัติ (เช่น สเปกกำหนดให้คืนภายใน 30 วัน)
+        const return_due_date = new Date();
+        return_due_date.setDate(return_due_date.getDate() + 30);
+
+        // บันทึกลงฐานข้อมูล สถานะเริ่มต้นเป็น PENDING อัตโนมัติตาม Schema
+        const newRequest = await TransferRequest.create({
+            from_hospital,
+            to_hospital,
+            drug_ref,
+            created_by,
+            quantity_requested,
+            return_due_date
+        });
+
+        return res.status(201).json({ success: true, data: newRequest });
+    } catch (error) {
+        console.error('❌ Create transfer request error:', error);
+        return res.status(500).json({ success: false, message: 'Server Error' });
+    }
+};
+
+// @desc    อนุมัติใบคำขอยืมยา และรันระบบล็อกสต็อกแบบ Transaction ปลอดภัยสูง
+// @route   PATCH /api/transfers/:id/approve
+const approveTransferRequest = async (req, res) => {
+    const { id } = req.params;
+    const { quantity_approved } = req.body; // รองรับกรณีกด Partial Fulfillment (ขอ 5 อนุมัติ 3)
+    const approved_by = req.user?._id || "64b5f9e2f1d2c3a4b5e6f7a9";
+
+    // 1. เริ่มเปิดใช้งาน Session สำหรับทำ Transaction
+    const session = await mongoose.startSession();
+    
+    try {
+        let updatedRequest = null;
+
+        // 2. ครอบการทำงานทั้งหมดด้วย withTransaction
+        await session.withTransaction(async () => {
+            
+            // 2.1 ค้นหาใบคำขอและตรวจสอบว่ายังเป็น PENDING อยู่ไหม
+            const transferRequest = await TransferRequest.findById(id).session(session);
+            if (!transferRequest || transferRequest.status !== 'PENDING') {
+                throw new Error('คำขอนี้ถูกดำเนินการไปแล้ว หรือไม่พบข้อมูลในระบบ');
+            }
+
+            const qty = quantity_approved || transferRequest.quantity_requested;
+            const fromHospital = transferRequest.from_hospital;
+            const drugId = transferRequest.drug_ref;
+
+            // 2.2 ตรวจสอบสต็อกจริงของ รพ. ต้นทาง (ผู้ให้ยืม)
+            const donorStock = await Inventory.findOne({ hospital_ref: fromHospital, drug_ref: drugId }).session(session);
+            if (!donorStock || donorStock.available_quantity < qty) {
+                throw new Error('โรงพยาบาลต้นทางมีปริมาณยาพร้อมให้ยืมไม่เพียงพอ');
+            }
+
+            // 2.3 [รันคีย์เวิร์ด MVP-14]: ตัดสต็อกและล็อกยอดแบบเป็นกลุ่ม (Atomic Update)
+            await Inventory.updateOne(
+                { hospital_ref: fromHospital, drug_ref: drugId },
+                { 
+                    $inc: { 
+                        available_quantity: -qty, // หักออกจากคลังที่พร้อมปล่อยยืม
+                        reserved_quantity: qty     // เอามาพักล็อคไว้ รอรถขนส่งมารับ
+                    } 
+                },
+                { session }
+            );
+
+            // 2.4 อัปเดตสถานะใบคำขอเป็น APPROVED ลงในคอลเลกชัน Transfers ด้วย .findOneAndUpdate()
+            updatedRequest = await TransferRequest.findByIdAndUpdate(
+                id,
+                {
+                    status: 'APPROVED',
+                    quantity_approved: qty,
+                    approved_by: approved_by
+                },
+                { new: true, session }
+            );
+
+            // 2.5 สร้างเอกสารใบสั่งจัดส่งสินค้า (DELIVERY) สถานะเริ่มต้น DISPATCHED รอรถพยาบาลวิ่ง
+            await Delivery.create([{
+                request_ref: id,
+                ems_unit_name: "Ambulance Zone 8 / UD-01", // ค่าจำลองเริ่มต้น
+                delivery_status: 'DISPATCHED'
+            }], { session });
+
+        });
+
+        // 3. ปิด Session เมื่อ Transaction ทำงานสำเร็จลุล่วงครบทุกบรรทัด
+        session.endSession();
+        return res.status(200).json({ success: true, message: 'อนุมัติและล็อกสต็อกยาสำเร็จ', data: updatedRequest });
+
+    } catch (error) {
+        // หากเกิด Error ตรงบรรทัดไหน ข้อมูลทั้งหมดจะถูก Rollback สต็อกจะไม่เพี้ยน
+        session.endSession();
+        console.error('❌ Transaction Approved Error:', error.message);
+        return res.status(400).json({ success: false, message: error.message });
+    }
+};
+
+// @desc    ปฏิเสธใบคำขอยืมยา (ไม่ต้องหักสต็อก)
+// @route   PATCH /api/transfers/:id/reject
+const rejectTransferRequest = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { rejection_reason } = req.body; // บังคับกรอกเหตุผลตามสเปก
+
+        if (!rejection_reason) {
+            return res.status(400).json({ success: false, message: 'จำเป็นต้องกรอกเหตุผลในการปฏิเสธคำขอ' });
+        }
+
+        // อัปเดตสถานะเป็น REJECTED และแนบเหตุผล
+        const updatedRequest = await TransferRequest.findByIdAndUpdate(
+            id,
+            {
+                status: 'REJECTED',
+                rejection_reason: rejection_reason
+            },
+            { new: true } // เพื่อให้ส่งค่าเวอร์ชันที่อัปเดตล่าสุดกลับไปให้ Frontend
+        );
+
+        if (!updatedRequest) {
+            return res.status(404).json({ success: false, message: 'ไม่พบใบคำขอนี้ในระบบ' });
+        }
+
+        return res.status(200).json({ success: true, message: 'ปฏิเสธคำขอยืมยาเรียบร้อย', data: updatedRequest });
+    } catch (error) {
+        console.error('❌ Reject transfer request error:', error);
+        return res.status(500).json({ success: false, message: 'Server Error' });
+    }
+};
+
+module.exports = {
+    createTransferRequest,
+    approveTransferRequest,
+    rejectTransferRequest
+};
