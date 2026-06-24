@@ -38,12 +38,12 @@ const getIncomingTransfers = async (req, res) => {
 const createTransferRequest = async (req, res) => {
     try {
         // ✂️ ตัด from_hospital ออกจาก req.body ไม่ต้องให้หน้าบ้านส่งมาแล้ว
-        const { to_hospital, drug_ref, quantity_requested } = req.body;
+        const { from_hospital, drug_ref, quantity_requested } = req.body;
         
         // 🔒 ดึง ID ผู้ใช้งาน และ ID โรงพยาบาลต้นทาง จาก Token ของคนที่ Login อยู่โดยตรง
         // (รองรับค่า Mock เผื่อกรณีลืมใส่ Token ตอนเทสใน Postman)
         const created_by = req.user?._id ; 
-        const from_hospital = req.user?.hospital_id ; // เปลี่ยนตรงนี้ให้เป็น ID รพ. คนที่ Login
+        const to_hospital = req.user?.hospital_id ; // เปลี่ยนตรงนี้ให้เป็น ID รพ. คนที่ Login
 
         // คำนวณวันกำหนดคืนอัตโนมัติ (คืนภายใน 30 วัน)
         const return_due_date = new Date();
