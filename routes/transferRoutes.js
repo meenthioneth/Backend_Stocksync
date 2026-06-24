@@ -4,11 +4,15 @@ const router = express.Router();
 const { 
     createTransferRequest, 
     approveTransferRequest, 
-    rejectTransferRequest 
+    rejectTransferRequest,
+    getIncomingTransfers
 } = require('../controllers/transferController');
 
-router.post('/', createTransferRequest);              // POST /api/transfers
-router.patch('/:id/approve', approveTransferRequest); // PATCH /api/transfers/:id/approve
-router.patch('/:id/reject', rejectTransferRequest);   // PATCH /api/transfers/:id/reject
+const { protect, authorize } = require('../middleware/authMiddleware');
+
+router.get('/inbox', protect, getIncomingTransfers);
+router.post('/', protect, createTransferRequest);
+router.patch('/:id/approve', protect, authorize('Chief_Pharmacist'), approveTransferRequest);
+router.patch('/:id/reject', protect, authorize('Chief_Pharmacist'), rejectTransferRequest);
 
 module.exports = router;

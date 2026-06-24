@@ -3,22 +3,55 @@ const mongoose = require('mongoose');
 const Inventory = require('../models/Inventory');
 const Delivery = require('../models/Delivery');
 
+// @desc    ดึงรายการคำขอยืมยาที่ส่งมาถึงโรงพยาบาลของฉัน (Page 4 - Inbox แท็บรออนุมัติ)
+// @route   GET /api/transfers/inbox
+const getIncomingTransfers = async (req, res) => {
+    try {
+        // ดึงไอดีโรงพยาบาลของผู้ใช้งานปัจจุบันที่แกะมาจาก Auth Token (จาก Middleware)
+        const myHospitalId = req.user?.hospital_id; 
+
+        if (!myHospitalId) {
+            return res.status(400).json({ success: false, message: 'ไม่พบข้อมูลโรงพยาบาลสังกัดในสิทธิ์ของคุณ' });
+        }
+
+        // ค้นหาคำขอในคอลเลกชัน โดยคัดกรองเฉพาะตัวที่ 'from_hospital' (ต้นทาง/ผู้ให้ยืม) ตรงกับ รพ. ของเรา
+        const inboxTransfers = await TransferRequest.find({ from_hospital: myHospitalId })
+            .populate('to_hospital', 'hospital_id hospital_name hospital_type') // รพ. ปลายทางที่ส่งคำขอมายืมเรา
+            .populate('drug_ref', 'drug_id generic_name trade_name category')
+            .sort({ createdAt: -1 }); // เอาคำขอล่าสุดขึ้นก่อน
+
+        return res.status(200).json({
+            success: true,
+            count: inboxTransfers.length,
+            data: inboxTransfers
+        });
+        
+    } catch (error) {
+        console.error('❌ Get incoming transfers error:', error);
+        return res.status(500).json({ success: false, message: 'Server Error' });
+    }
+};
+
+
 // @desc    สร้างใบคำขอยืมยาใหม่ (Page 4 - New Request)
 // @route   POST /api/transfers
 const createTransferRequest = async (req, res) => {
     try {
-        const { from_hospital, to_hospital, drug_ref, quantity_requested } = req.body;
+        // ✂️ ตัด from_hospital ออกจาก req.body ไม่ต้องให้หน้าบ้านส่งมาแล้ว
+        const { to_hospital, drug_ref, quantity_requested } = req.body;
         
-        // ดึง ID ผู้ใช้งานที่ล็อกอินอยู่ (สมมติว่าผ่าน Auth Middleware มาแล้ว)
-        const created_by = req.user?._id || "64b5f9e2f1d2c3a4b5e6f7a8"; // ใส่ ID จำลองไว้ก่อนถ้ายังไม่ทำ Auth
+        // 🔒 ดึง ID ผู้ใช้งาน และ ID โรงพยาบาลต้นทาง จาก Token ของคนที่ Login อยู่โดยตรง
+        // (รองรับค่า Mock เผื่อกรณีลืมใส่ Token ตอนเทสใน Postman)
+        const created_by = req.user?._id ; 
+        const from_hospital = req.user?.hospital_id ; // เปลี่ยนตรงนี้ให้เป็น ID รพ. คนที่ Login
 
-        // คำนวณวันกำหนดคืนอัตโนมัติ (เช่น สเปกกำหนดให้คืนภายใน 30 วัน)
+        // คำนวณวันกำหนดคืนอัตโนมัติ (คืนภายใน 30 วัน)
         const return_due_date = new Date();
         return_due_date.setDate(return_due_date.getDate() + 30);
 
-        // บันทึกลงฐานข้อมูล สถานะเริ่มต้นเป็น PENDING อัตโนมัติตาม Schema
+        // บันทึกลงฐานข้อมูล โดยใช้ค่า from_hospital ที่ระบบดึงมาให้เอง
         const newRequest = await TransferRequest.create({
-            from_hospital,
+            from_hospital, // 👈 ใช้ค่าที่ได้จากสิทธิ์การ Login
             to_hospital,
             drug_ref,
             created_by,
@@ -26,7 +59,13 @@ const createTransferRequest = async (req, res) => {
             return_due_date
         });
 
-        return res.status(201).json({ success: true, data: newRequest });
+        // แตกข้อมูลผูกความสัมพันธ์ออกมาโชว์ให้หน้าบ้าน
+        const populatedRequest = await TransferRequest.findById(newRequest._id)
+            .populate('from_hospital', 'hospital_id hospital_name hospital_type') 
+            .populate('to_hospital', 'hospital_id hospital_name hospital_type')
+            .populate('drug_ref', 'drug_id generic_name trade_name category');
+
+        return res.status(201).json({ success: true, data: populatedRequest });
     } catch (error) {
         console.error('❌ Create transfer request error:', error);
         return res.status(500).json({ success: false, message: 'Server Error' });
@@ -144,5 +183,6 @@ const rejectTransferRequest = async (req, res) => {
 module.exports = {
     createTransferRequest,
     approveTransferRequest,
-    rejectTransferRequest
+    rejectTransferRequest,
+    getIncomingTransfers
 };

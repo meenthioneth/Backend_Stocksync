@@ -53,6 +53,7 @@ const getNetworkOverview = async (req, res) => {
     }
 };
 
+
 module.exports = {
-    getNetworkOverview
+    getNetworkOverview,
 };

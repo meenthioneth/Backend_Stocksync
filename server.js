@@ -27,7 +27,9 @@ app.get('/', (req, res) => {
 // Registering API Routes (เปิดท่อส่งข้อมูลทั้งหมด)
 app.use('/api/inventory', require('./routes/inventoryRoutes'));
 app.use('/api/ai', require('./routes/aiRoutes'));
-app.use('/api/transfers', require('./routes/transferRoutes')); // 👈 จุดที่เพิ่มล่าสุด
+app.use('/api/transfers', require('./routes/transferRoutes')); 
+app.use('/api/auth', require('./routes/authRoutes'));
+app.use('/api/hospitals', require('./routes/hospitalRoutes')); // GET /api/hospitals/:id
 
 // Error Handling Middleware พื้นฐาน (เผื่อมีอะไรพังในระบบ)
 app.use((err, req, res, next) => {
