@@ -208,7 +208,99 @@ const getAlertQueue = async (req, res) => {
     }
 };
 
+// =========================================================================
+// @desc    ดึงข้อมูลโรงพยาบาลที่มีปัญหายาวิกฤต และยาใกล้หมดอายุ เพื่อนำไปปักหมุดบนแผนที่
+// @route   GET /api/ai/map-analytics
+// =========================================================================
+const getMapAnalytics = async (req, res) => {
+    try {
+        // 1. กำหนดช่วงเวลา 90 วัน สำหรับเช็คยาใกล้หมดอายุ
+        const targetDate = new Date();
+        targetDate.setDate(targetDate.getDate() + 90);
+
+        // 2. ดึงข้อมูลคลังยาทั้งหมดเพื่อมาวิเคราะห์สถานะรายคลัง
+        const allInventory = await Inventory.find()
+            .populate('hospital_ref')
+            .populate('drug_ref');
+
+        const mapMarkers = [];
+
+        // 3. วนลูปตรวจสอบเงื่อนไขสต็อกวิกฤต และล็อตใกล้หมดอายุ
+        for (const item of allInventory) {
+            const hospital = item.hospital_ref;
+            const drug = item.drug_ref;
+
+            if (!hospital || !hospital.location || !hospital.location.coordinates) continue;
+
+            const coordinates = hospital.location.coordinates; // [longitude, latitude] ตามมาตรฐาน GeoJSON
+
+            // 🔴 เงื่อนไขที่ 1: สต็อกต่ำกว่า Safety Stock (วิกฤตเสี่ยงยาขาด)
+            if (item.available_quantity <= item.safety_stock_level) {
+                mapMarkers.push({
+                    marker_type: 'CRITICAL_STOCK', // สำหรับหน้าบ้านแยกสีหมุด (เช่น สีแดง)
+                    hospital_id: hospital._id,
+                    hospital_name: hospital.hospital_name,
+                    coordinates: {
+                        lng: coordinates[0],
+                        lat: coordinates[1]
+                    },
+                    drug_info: {
+                        drug_id: drug._id,
+                        generic_name: drug.generic_name,
+                        trade_name: drug.trade_name,
+                        category: drug.category
+                    },
+                    details: {
+                        current_stock: item.available_quantity,
+                        safety_level: item.safety_stock_level,
+                        alert_message: `🚨 สต็อกวิกฤต: ยาเหลือเพียง ${item.available_quantity} ชิ้น (เกณฑ์ปลอดภัยคือ ${item.safety_stock_level} ชิ้น)`
+                    }
+                });
+            }
+
+            // 🟡 เงื่อนไขที่ 2: ตรวจสอบล็อตย่อยที่มีอายุเหลือน้อยกว่า 90 วัน (เสี่ยงยาหมดอายุคาคลัง)
+            const expiringLots = item.lots.filter(lot => lot.expiry_date <= targetDate && lot.quantity_in_lot > 0);
+            
+            for (const lot of expiringLots) {
+                mapMarkers.push({
+                    marker_type: 'NEAR_EXPIRY', // สำหรับหน้าบ้านแยกสีหมุด (เช่น สีเหลือง หรือ ส้ม)
+                    hospital_id: hospital._id,
+                    hospital_name: hospital.hospital_name,
+                    coordinates: {
+                        lng: coordinates[0],
+                        lat: coordinates[1]
+                    },
+                    drug_info: {
+                        drug_id: drug._id,
+                        generic_name: drug.generic_name,
+                        trade_name: drug.trade_name,
+                        category: drug.category
+                    },
+                    details: {
+                        lot_number: lot.lot_number,
+                        expiry_date: lot.expiry_date,
+                        quantity: lot.quantity_in_lot,
+                        alert_message: `⏳ เสี่ยงหมดอายุ: ล็อต ${lot.lot_number} จำนวน ${lot.quantity_in_lot} ชิ้น จะหมดอายุในวันที่ ${new Date(lot.expiry_date).toLocaleDateString('th-TH')}`
+                    }
+                });
+            }
+        }
+
+        return res.status(200).json({
+            success: true,
+            count: mapMarkers.length,
+            data: mapMarkers
+        });
+
+    } catch (error) {
+        console.error('❌ AI Map Analytics error:', error);
+        return res.status(500).json({ success: false, message: 'Server Error' });
+    }
+};
+
+// อัปเดตการ exports ส่งออกฟังก์ชันตัวใหม่ด้วยครับ
 module.exports = {
     getAlertQueue,
-    getExpiryRedistribution
+    getExpiryRedistribution,
+    getMapAnalytics // 🌟 เพิ่มตัวนี้เข้าไปในลิสต์การส่งออก
 };
