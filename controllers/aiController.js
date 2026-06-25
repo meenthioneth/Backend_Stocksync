@@ -298,9 +298,90 @@ const getMapAnalytics = async (req, res) => {
     }
 };
 
+// =========================================================================
+// @desc    ค้นหายาฉุกเฉิน Real-Time บนแผนที่ (กรองอัตโนมัติจากโรงพยาบาลที่ผู้ใช้ Login)
+// @route   POST /api/ai/search-emergency
+// =========================================================================
+const searchEmergencyDrug = async (req, res) => {
+    try {
+        const { drug_id } = req.body;
+
+        if (!drug_id) {
+            return res.status(400).json({ success: false, message: 'โปรดระบุตัวยาที่ต้องการค้นหา' });
+        }
+
+        // 🧠 ดึงไอดีโรงพยาบาลอัตโนมัติจากระบบผู้ใช้ที่ Login อยู่ (req.user)
+        // แต่ทำ Fallback เผื่อใส่ใน req.body.from_hospital_id ไว้ให้ใช้ทดสอบใน Postman ช่วงแรกได้ครับ
+        const from_hospital_id = req.user?.hospital_id || req.user?.hospital?.objectId || req.body.from_hospital_id;
+
+        if (!from_hospital_id) {
+            return res.status(401).json({ 
+                success: false, 
+                message: 'ไม่พบข้อมูลโรงพยาบาลต้นทาง (โปรดตรวจสอบสถานะการ Login หรือส่ง from_hospital_id มาทดสอบ)' 
+            });
+        }
+
+        // 1. ดึงข้อมูลพิกัดของ รพ. ต้นทาง (ผู้ใช้ที่กำลังใช้งานระบบ)
+        const Hospital = require('../models/Hospital');
+        const sourceHospital = await Hospital.findById(from_hospital_id);
+        if (!sourceHospital) return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลโรงพยาบาลต้นทางในระบบ' });
+
+        const [srcLong, srcLat] = sourceHospital.location.coordinates;
+
+        // 2. ค้นหา รพ. อื่น ๆ ในระบบที่มีสต็อกยาตัวนี้ และมียาเหลือเฟือพร้อมปล่อยยืม (> Safety Stock)
+        const allInventory = await Inventory.find({ drug_ref: drug_id })
+            .populate('hospital_ref')
+            .populate('drug_ref');
+
+        const searchResults = allInventory
+            .filter(item => 
+                item.hospital_ref && 
+                item.hospital_ref._id.toString() !== from_hospital_id.toString() && 
+                item.available_quantity > item.safety_stock_level
+            )
+            .map(item => {
+                const donorHosp = item.hospital_ref;
+                const [donorLong, donorLat] = donorHosp.location.coordinates;
+
+                // คำนวणระยะทางจริง (กิโลเมตร) ด้วย Haversine Formula
+                const distance = calculateDistance(srcLat, srcLong, donorLat, donorLong);
+
+                // 🚚 คำนวณเวลาขนส่งฉุกเฉินเฉลี่ยโดยประมาณ (ETA)
+                // รถวิ่งเฉลี่ยความเร็วในพื้นที่ 60 กม./ชม. (1 กม. = 1 นาที) + เวลาจัดเตรียมบวกแพ็คยาเร่งด่วน 10 นาที
+                const baseDrivingMinutes = distance * 1.0; 
+                const totalDeliveryMinutes = Math.round(baseDrivingMinutes + 10);
+
+                return {
+                    inventory_id: item._id,
+                    hospital_id: donorHosp._id,
+                    hospital_name: donorHosp.hospital_name,
+                    coordinates: { lng: donorLong, lat: donorLat },
+                    available_quantity: item.available_quantity,
+                    distance_km: parseFloat(distance.toFixed(1)),
+                    estimated_time_minutes: totalDeliveryMinutes, // ส่งเวลาขนส่ง (นาที) ไปพล็อตเส้นทางบนแมพ
+                    network_zone: donorHosp.network_group_id
+                };
+            })
+            // เคสฉุกเฉินเน้น "ความเร็วสูงสุด" ดึง รพ. ที่ใช้เวลาขนส่งน้อยที่สุดขึ้นก่อน
+            .sort((a, b) => a.estimated_time_minutes - b.estimated_time_minutes);
+
+        return res.status(200).json({ 
+            success: true, 
+            from_hospital_name: sourceHospital.hospital_name,
+            count: searchResults.length, 
+            data: searchResults 
+        });
+
+    } catch (error) {
+        console.error('❌ Search Emergency Drug Error:', error);
+        return res.status(500).json({ success: false, message: 'Server Error' });
+    }
+};
+
 // อัปเดตการ exports ส่งออกฟังก์ชันตัวใหม่ด้วยครับ
 module.exports = {
     getAlertQueue,
     getExpiryRedistribution,
-    getMapAnalytics // 🌟 เพิ่มตัวนี้เข้าไปในลิสต์การส่งออก
+    getMapAnalytics,
+    searchEmergencyDrug
 };
