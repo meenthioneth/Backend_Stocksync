@@ -27,12 +27,14 @@ const getNetworkOverview = async (req, res) => {
             return {
                 inventory_id: item._id,
                 hospital: {
+                    objectId: item.hospital_ref._id, // 👈 Mongo ObjectId จริง ใช้ส่งเป็น from_hospital ตอนสร้างคำขอ
                     id: item.hospital_ref.hospital_id,
                     name: item.hospital_ref.hospital_name,
                     type: item.hospital_ref.hospital_type,
                     coordinates: item.hospital_ref.location.coordinates // [long, lat]
                 },
                 drug: {
+                    objectId: item.drug_ref._id, // 👈 Mongo ObjectId จริง ใช้ส่งเป็น drug_ref ตอนสร้างคำขอ
                     id: item.drug_ref.drug_id,
                     generic_name: item.drug_ref.generic_name,
                     trade_name: item.drug_ref.trade_name,

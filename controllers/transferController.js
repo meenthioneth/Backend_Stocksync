@@ -33,26 +33,62 @@ const getIncomingTransfers = async (req, res) => {
 };
 
 
+// @desc    ดึงรายการคำขอยืมยาที่โรงพยาบาลของฉันส่งออกไปขอยืมจาก รพ. อื่น (Page 4 - Outbox)
+// @route   GET /api/transfers/outbox
+const getOutgoingTransfers = async (req, res) => {
+    try {
+        const myHospitalId = req.user?.hospital_id;
+
+        if (!myHospitalId) {
+            return res.status(400).json({ success: false, message: 'ไม่พบข้อมูลโรงพยาบาลสังกัดในสิทธิ์ของคุณ' });
+        }
+
+        // ค้นหาคำขอที่ 'to_hospital' (ผู้ขอยืม) ตรงกับ รพ. ของเรา = คำขอที่เราส่งออกไปเอง
+        const outboxTransfers = await TransferRequest.find({ to_hospital: myHospitalId })
+            .populate('from_hospital', 'hospital_id hospital_name hospital_type') // รพ. ต้นทางที่เราขอยืม
+            .populate('drug_ref', 'drug_id generic_name trade_name category')
+            .sort({ createdAt: -1 });
+
+        return res.status(200).json({
+            success: true,
+            count: outboxTransfers.length,
+            data: outboxTransfers
+        });
+
+    } catch (error) {
+        console.error('❌ Get outgoing transfers error:', error);
+        return res.status(500).json({ success: false, message: 'Server Error' });
+    }
+};
+
+
 // @desc    สร้างใบคำขอยืมยาใหม่ (Page 4 - New Request)
 // @route   POST /api/transfers
 const createTransferRequest = async (req, res) => {
     try {
-        // ✂️ ตัด from_hospital ออกจาก req.body ไม่ต้องให้หน้าบ้านส่งมาแล้ว
+        // 🔧 [แก้ไข] ผู้ใช้งานที่ Login เป็นฝั่ง "ผู้ขอยืม" (to_hospital) เสมอ
+        // ส่วน "ผู้ให้ยืม" (from_hospital) ต้องให้หน้าบ้านเลือกและส่งมาเอง เพราะ
+        // ทุก รพ. สามารถขอยืมจาก รพ. อื่นได้อย่างอิสระ ไม่ตายตัวว่าใครเป็นผู้ให้ยืม
         const { from_hospital, drug_ref, quantity_requested } = req.body;
-        
-        // 🔒 ดึง ID ผู้ใช้งาน และ ID โรงพยาบาลต้นทาง จาก Token ของคนที่ Login อยู่โดยตรง
-        // (รองรับค่า Mock เผื่อกรณีลืมใส่ Token ตอนเทสใน Postman)
-        const created_by = req.user?._id ; 
-        const to_hospital = req.user?.hospital_id ; // เปลี่ยนตรงนี้ให้เป็น ID รพ. คนที่ Login
+
+        const created_by = req.user?._id;
+        const to_hospital = req.user?.hospital_id; // 👈 รพ. ของผู้ขอยืม มาจาก Token เสมอ
+
+        if (!from_hospital || !drug_ref || !quantity_requested) {
+            return res.status(400).json({
+                success: false,
+                message: 'กรุณาระบุโรงพยาบาลต้นทาง (from_hospital), drug_ref และ quantity_requested ให้ครบถ้วน'
+            });
+        }
 
         // คำนวณวันกำหนดคืนอัตโนมัติ (คืนภายใน 30 วัน)
         const return_due_date = new Date();
         return_due_date.setDate(return_due_date.getDate() + 30);
 
-        // บันทึกลงฐานข้อมูล โดยใช้ค่า from_hospital ที่ระบบดึงมาให้เอง
+        // บันทึกลงฐานข้อมูล โดยใช้ to_hospital ที่ระบบดึงมาให้เอง และ from_hospital ที่หน้าบ้านเลือก
         const newRequest = await TransferRequest.create({
-            from_hospital, // 👈 ใช้ค่าที่ได้จากสิทธิ์การ Login
-            to_hospital,
+            from_hospital, // 👈 รพ. ต้นทาง/ผู้ให้ยืม ที่ผู้ใช้เลือกจากหน้าฟอร์ม
+            to_hospital,   // 👈 รพ. ของผู้ใช้งานที่ Login อยู่ (ผู้ขอยืม)
             drug_ref,
             created_by,
             quantity_requested,
@@ -184,5 +220,6 @@ module.exports = {
     createTransferRequest,
     approveTransferRequest,
     rejectTransferRequest,
-    getIncomingTransfers
+    getIncomingTransfers,
+    getOutgoingTransfers
 };

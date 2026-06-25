@@ -12,8 +12,13 @@ const loginUser = async (req, res) => {
             return res.status(400).json({ success: false, message: 'กรุณากรอกข้อมูลให้ครบถ้วน' });
         }
 
-        // 2. ค้นหาผู้ใช้งานในคอลเลกชัน USER (พร้อมตรวจสอบว่ามีโรงพยาบาลสังกัดไหม)
-        const user = await User.findOne({ username });
+        // 2. ค้นหาผู้ใช้งานในคอลเลกชัน USER พร้อม populate ข้อมูลโรงพยาบาลสังกัดมาด้วยเลย
+        // (หน้าบ้านต้องรู้ชื่อ/รหัส สธ. ของ รพ. ตั้งแต่ตอน login เพื่อแสดงผลใน Topbar
+        // โดยไม่ต้องไปไล่หาจาก network-overview ซึ่งไม่มี Mongo ObjectId ให้ match กลับ)
+        const user = await User.findOne({ username }).populate(
+            'hospital_ref',
+            'hospital_id hospital_name hospital_type health_zone'
+        );
         if (!user) {
             return res.status(401).json({ success: false, message: 'ชื่อผู้ใช้งานหรือรหัสผ่านไม่ถูกต้อง' });
         }
@@ -29,7 +34,7 @@ const loginUser = async (req, res) => {
                 _id: user._id, 
                 username: user.username,
                 role: user.role, // Chief_Pharmacist หรือ Nurse
-                hospital_id: user.hospital_ref, // ID โรงพยาบาลสังกัด
+                hospital_id: user.hospital_ref._id, // ID โรงพยาบาลสังกัด (Mongo ObjectId)
                 health_zone: 8
             },
             process.env.NEXTAUTH_SECRET, // ใช้คีย์ร่วมกับ NextAuth ฝั่งหน้าบ้าน
@@ -37,6 +42,7 @@ const loginUser = async (req, res) => {
         );
 
         // 5. ส่งข้อมูลกลับไปให้ Next.js (หน้าบ้าน) นำไปเก็บไว้ใน Session
+        // แนบข้อมูลโรงพยาบาล (hospital object) แบบเต็มไปด้วย ไม่ใช่แค่ ObjectId เปล่าๆ
         return res.status(200).json({
             success: true,
             message: 'เข้าสู่ระบบสำเร็จ',
@@ -44,8 +50,14 @@ const loginUser = async (req, res) => {
             user: {
                 id: user._id,
                 name: user.name,
+                username: user.username,
                 role: user.role,
-                hospital_id: user.hospital_ref
+                hospital: {
+                    objectId: user.hospital_ref._id,
+                    hospital_id: user.hospital_ref.hospital_id,
+                    hospital_name: user.hospital_ref.hospital_name,
+                    hospital_type: user.hospital_ref.hospital_type
+                }
             }
         });
 
