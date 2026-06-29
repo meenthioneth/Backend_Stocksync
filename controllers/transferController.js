@@ -163,11 +163,12 @@ const approveTransferRequest = async (req, res) => {
                 { new: true, session }
             );
 
-            // 2.5 สร้างเอกสารใบสั่งจัดส่งสินค้า (DELIVERY) สถานะเริ่มต้น DISPATCHED รอรถพยาบาลวิ่ง
+            // 2.5 สร้างเอกสารใบสั่งจัดส่งสินค้า (DELIVERY) สถานะเริ่มต้น PREPARING
+            // (อนุมัติ -> เตรียมจัดส่ง -> กำลังจัดส่ง -> ส่งมอบแล้ว)
             await Delivery.create([{
                 request_ref: id,
                 ems_unit_name: "Ambulance Zone 8 / UD-01", // ค่าจำลองเริ่มต้น
-                delivery_status: 'DISPATCHED'
+                delivery_status: 'PREPARING'
             }], { session });
 
         });

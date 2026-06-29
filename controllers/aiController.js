@@ -1,6 +1,9 @@
 const Inventory = require('../models/Inventory');
+const DrugUsageRate = require('../models/DrugUsageRate');
 
 // สูตรคำนวณระยะทางระหว่างพิกัด GPS 2 จุด (Haversine Formula) คืนค่าเป็นกิโลเมตร
+// ใช้เป็นค่าประมาณคร่าวๆ สำหรับ AI Matching (expiry-redistribution) และเป็น fallback
+// เผื่อเรียก Longdo Route API ไม่สำเร็จ (เน็ตหลุด/ยังไม่ตั้งค่า key/เกินโควต้า)
 const calculateDistance = (lat1, lon1, lat2, lon2) => {
     const R = 6371; // รัศมีของโลก (กิโลเมตร)
     const dLat = (lat2 - lat1) * Math.PI / 180;
@@ -11,6 +14,168 @@ const calculateDistance = (lat1, lon1, lat2, lon2) => {
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
     return R * c; 
 };
+
+/**
+ * เรียก Longdo Map "Calculate route" REST API เพื่อหาระยะทาง+เวลาขนส่งจริงตามถนน
+ * (ไม่ใช่เส้นตรงแบบ Haversine) — ใช้ตอนค้นหายาฉุกเฉินซึ่งต้องการ ETA ที่แม่นยำที่สุด
+ * Docs: https://api.longdo.com/map/doc/rest.php#RouteCalc
+ *
+ * @returns {Promise<{distanceKm: number, minutes: number, isEstimate: boolean}>}
+ *   isEstimate = true หมายถึง Longdo เรียกไม่สำเร็จ ใช้ Haversine ประมาณแทนชั่วคราว
+ */
+const calculateRealRoute = async (fromLat, fromLon, toLat, toLon) => {
+    const fallback = () => {
+        const distanceKm = calculateDistance(fromLat, fromLon, toLat, toLon);
+        // ประมาณรถวิ่ง 60 กม./ชม. + เวลาเตรียมยาเร่งด่วน 10 นาที (ใช้เฉพาะตอน Longdo เรียกไม่สำเร็จ)
+        const minutes = Math.round(distanceKm * 1.0 + 10);
+        return { distanceKm: parseFloat(distanceKm.toFixed(1)), minutes, isEstimate: true };
+    };
+
+    const apiKey = process.env.LONGDO_MAP_API_KEY;
+    if (!apiKey) return fallback();
+
+    try {
+        const params = new URLSearchParams({
+            flon: fromLon, flat: fromLat,
+            tlon: toLon, tlat: toLat,
+            mode: 't', // หลบรถติดด้วยข้อมูลเรียลไทม์/พยากรณ์ ตรงกับสเปก "เร็วที่สุด"
+            key: apiKey
+        });
+
+        const response = await fetch(`https://api.longdo.com/RouteService/json/route/guide?${params}`);
+        if (!response.ok) return fallback();
+
+        const json = await response.json();
+        const route = json?.data?.[0];
+        // meta.status มีเฉพาะตอน error (400/403/404/410) — ไม่มี route ที่หาทางไปไม่ได้ก็ fallback
+        if (json?.meta?.status || !route || typeof route.distance !== 'number') return fallback();
+
+        return {
+            distanceKm: parseFloat((route.distance / 1000).toFixed(1)),
+            minutes: Math.round(route.interval / 60),
+            isEstimate: false
+        };
+    } catch (error) {
+        console.error('⚠️ Longdo Route API เรียกไม่สำเร็จ ใช้ค่าประมาณ Haversine แทน:', error.message);
+        return fallback();
+    }
+};
+
+// =========================================================================
+// @desc    ดึงรายการยาที่เสี่ยงหมดอายุภายใน 90 วัน พร้อม AI Match จับคู่ รพ. ที่ความต้องการสูง
+// @route   GET /api/ai/expiry-redistribution
+// =========================================================================
+const getExpiryRedistribution = async (req, res) => {
+    try {
+        // 1. ตั้งเกณฑ์เวลา: ค้นหาล็อตยาที่จะหมดอายุภายใน 90 วันนับจากวันนี้
+        const targetDate = new Date();
+        targetDate.setDate(targetDate.getDate() + 90);
+
+        // 2. ดึงข้อมูล Inventory ทั้งหมดที่มีล๊อตย่อยใกล้หมดอายุ และยังมีของเหลืออยู่จริง
+        const activeInventories = await Inventory.find({
+            "lots.expiry_date": { $lte: targetDate },
+            "lots.quantity_in_lot": { $gt: 0 }
+        })
+        .populate('hospital_ref')
+        .populate('drug_ref');
+
+        const aiRecommendations = [];
+
+        // 3. วนลูปเพื่อนำแต่ละคลังสินค้าที่ "เสี่ยงยาหมดอายุ" มาทำ AI Matching Logic ด้วย GPS & Demand
+        for (const item of activeInventories) {
+            const sourceHospital = item.hospital_ref;
+            const targetDrug = item.drug_ref;
+
+            const sourceLong = sourceHospital.location.coordinates[0];
+            const sourceLat = sourceHospital.location.coordinates[1];
+
+            // กรองหาเฉพาะตัวล็อตย่อยที่ใกล้หมดอายุจริง ๆ ใน Inventory แถวนั้น
+            const expiringLots = item.lots.filter(lot => lot.expiry_date <= targetDate && lot.quantity_in_lot > 0);
+            
+            for (const lot of expiringLots) {
+                const quantityToMove = lot.quantity_in_lot;
+
+                // 🧠 [AI Matching Logic] 
+                // ค้นหา "โรงพยาบาลปลายทาง" ที่ควรรับยานี้ไปใช้ต่อ โดยอิงจากสถิติอัตราใช้ยา (DrugUsageRate)
+                // เงื่อนไข: ต้องไม่ใช่โรงพยาบาลเดิมที่เป็นเจ้าของยา และต้องเป็นยาตัวเดียวกัน
+                const potentialRecipients = await DrugUsageRate.find({
+                    drug_ref: targetDrug._id,
+                    hospital_ref: { $ne: sourceHospital._id } // ห้ามส่งให้ตัวเอง
+                })
+                .populate('hospital_ref');
+
+                // นำผู้รับที่มีแนวโน้มมาคำนวณคะแนน GPS ระยะทาง และสัดส่วน Demand ความต้องการจ่ายยา
+                const suggestions = potentialRecipients.map(recipient => {
+                    const recipientHospital = recipient.hospital_ref;
+                    const recipientLong = recipientHospital.location.coordinates[0];
+                    const recipientLat = recipientHospital.location.coordinates[1];
+
+                    // คำนวณระยะทางจริงเชิงพิกัด (กิโลเมตร)
+                    const distance = calculateDistance(sourceLat, sourceLong, recipientLat, recipientLong);
+
+                    // 1. คะแนนความต้องการ (Demand Score): ยิ่งมีอัตราใช้ยาเฉลี่ยต่อเดือนสูง ยิ่งเคลียร์ยาได้ทัน (เต็ม 50 คะแนน)
+                    // ตัวอย่างสูตร: ยอดเบิกจ่ายเฉลี่ยต่อเดือนของ รพ. ปลายทาง หารด้วยเกณฑ์ความเหมาะสม
+                    const demandScore = Math.min(50, recipient.average_monthly_usage * 0.25);
+
+                    // 2. คะแนนระยะทาง (Distance Score): ยิ่งอยู่ใกล้กันยิ่งกระจายง่าย ขนส่งสะดวก (เต็ม 50 คะแนน)
+                    const distanceScore = Math.max(0, 50 - (distance * 0.8));
+
+                    // 3. คะแนนโซนเครือข่ายโบนัส: ถ้าอยู่กลุ่มรหัสโซนพื้นที่เดียวกัน (เช่น UD-EAST เหมือนกัน)
+                    const isSameZone = sourceHospital.network_group_id === recipientHospital.network_group_id;
+                    let totalScore = demandScore + distanceScore;
+                    if (isSameZone) totalScore += 10; // มอบคะแนนพิเศษให้โรงพยาบาลในเครือย่อยเดียวกัน
+
+                    // แปลงคะแนนรวมให้อยู่ในรูป Confidence Score ค่า 0.0 - 1.0 (ตามสเปก)
+                    const confidenceScore = parseFloat(Math.min(1.0, totalScore / 100).toFixed(2));
+
+                    return {
+                        to_hospital_id: recipientHospital._id,
+                        hospital_name: recipientHospital.hospital_name,
+                        average_monthly_usage: recipient.average_monthly_usage,
+                        distance_km: parseFloat(distance.toFixed(1)),
+                        confidence_score: confidenceScore,
+                        reasoning: `พบ ${recipientHospital.hospital_name} มีอัตราเบิกจ่ายใช้ยาชนิดนี้สูงถึง ${recipient.average_monthly_usage} ชิ้น/เดือน อยู่ห่างออกไปเพียง ${distance.toFixed(1)} กม. ${isSameZone ? '(จัดอยู่ในพื้นที่เครือข่ายย่อยเดียวกัน)' : ''}`
+                    };
+                })
+                // เรียงลำดับโรงพยาบาลปลายทางที่ AI มั่นใจที่สุดและเหมาะสมที่สุดขึ้นก่อน
+                .sort((a, b) => b.confidence_score - a.confidence_score);
+
+                // บันทึกและจัดฟอร์แมตฟิลด์เพื่อส่งออกไปเป็นหน้า Card สวย ๆ บนหน้าจอ Next.js
+                aiRecommendations.push({
+                    inventory_id: item._id,
+                    drug_id: targetDrug._id, // 👈 Mongo ObjectId ของยา — ใช้สร้างคำขอยืม/โอนย้ายต่อได้ตรงๆ
+                    drug_name: targetDrug.generic_name,
+                    trade_name: targetDrug.trade_name,
+                    category: targetDrug.category,
+                    from_hospital_id: sourceHospital._id, // 👈 Mongo ObjectId ของ รพ.ต้นทาง (เจ้าของล็อตที่เสี่ยงหมดอายุ)
+                    from_hospital: sourceHospital.hospital_name,
+                    expiring_lot: {
+                        lot_number: lot.lot_number,
+                        expiry_date: lot.expiry_date,
+                        quantity: quantityToMove
+                    },
+                    // AI Suggestion: เลือกหยิบเอา รพ. ที่ทำคะแนนรวม GPS + Demand ได้เป็นอันดับ 1 มาเป็นข้อเสนอแนะนำ
+                    ai_suggestion: suggestions.length > 0 ? suggestions[0] : {
+                        hospital_name: "ไม่พบโรงพยาบาลปลายทางในเครือข่ายที่มียอดความต้องการใช้ยานี้",
+                        confidence_score: 0.0,
+                        reasoning: "ไม่มีสถิติความต้องการใช้นอกคลังต้นทาง โปรดตรวจสอบระดับสต็อกในภาพรวมระบบอีกครั้ง"
+                    }
+                });
+            }
+        }
+
+        return res.status(200).json({ 
+            success: true, 
+            count: aiRecommendations.length, 
+            data: aiRecommendations 
+        });
+
+    } catch (error) {
+        console.error('❌ AI Expiry Redistribution error:', error);
+        return res.status(500).json({ success: false, message: 'Server Error' });
+    }
+};
+
 
 // @desc    ดึงรายการแจ้งเตือนยากลุ่มวิกฤต พร้อมคำแนะนำจาก AI (Alert Queue)
 // @route   GET /api/ai/alert-queue
@@ -93,6 +258,180 @@ const getAlertQueue = async (req, res) => {
     }
 };
 
+// =========================================================================
+// @desc    ดึงข้อมูลโรงพยาบาลที่มีปัญหายาวิกฤต และยาใกล้หมดอายุ เพื่อนำไปปักหมุดบนแผนที่
+// @route   GET /api/ai/map-analytics
+// =========================================================================
+const getMapAnalytics = async (req, res) => {
+    try {
+        // 1. กำหนดช่วงเวลา 90 วัน สำหรับเช็คยาใกล้หมดอายุ
+        const targetDate = new Date();
+        targetDate.setDate(targetDate.getDate() + 90);
+
+        // 2. ดึงข้อมูลคลังยาทั้งหมดเพื่อมาวิเคราะห์สถานะรายคลัง
+        const allInventory = await Inventory.find()
+            .populate('hospital_ref')
+            .populate('drug_ref');
+
+        const mapMarkers = [];
+
+        // 3. วนลูปตรวจสอบเงื่อนไขสต็อกวิกฤต และล็อตใกล้หมดอายุ
+        for (const item of allInventory) {
+            const hospital = item.hospital_ref;
+            const drug = item.drug_ref;
+
+            if (!hospital || !hospital.location || !hospital.location.coordinates) continue;
+
+            const coordinates = hospital.location.coordinates; // [longitude, latitude] ตามมาตรฐาน GeoJSON
+
+            // 🔴 เงื่อนไขที่ 1: สต็อกต่ำกว่า Safety Stock (วิกฤตเสี่ยงยาขาด)
+            if (item.available_quantity <= item.safety_stock_level) {
+                mapMarkers.push({
+                    marker_type: 'CRITICAL_STOCK', // สำหรับหน้าบ้านแยกสีหมุด (เช่น สีแดง)
+                    hospital_id: hospital._id,
+                    hospital_name: hospital.hospital_name,
+                    coordinates: {
+                        lng: coordinates[0],
+                        lat: coordinates[1]
+                    },
+                    drug_info: {
+                        drug_id: drug._id,
+                        generic_name: drug.generic_name,
+                        trade_name: drug.trade_name,
+                        category: drug.category
+                    },
+                    details: {
+                        current_stock: item.available_quantity,
+                        safety_level: item.safety_stock_level,
+                        alert_message: `🚨 สต็อกวิกฤต: ยาเหลือเพียง ${item.available_quantity} ชิ้น (เกณฑ์ปลอดภัยคือ ${item.safety_stock_level} ชิ้น)`
+                    }
+                });
+            }
+
+            // 🟡 เงื่อนไขที่ 2: ตรวจสอบล็อตย่อยที่มีอายุเหลือน้อยกว่า 90 วัน (เสี่ยงยาหมดอายุคาคลัง)
+            const expiringLots = item.lots.filter(lot => lot.expiry_date <= targetDate && lot.quantity_in_lot > 0);
+            
+            for (const lot of expiringLots) {
+                mapMarkers.push({
+                    marker_type: 'NEAR_EXPIRY', // สำหรับหน้าบ้านแยกสีหมุด (เช่น สีเหลือง หรือ ส้ม)
+                    hospital_id: hospital._id,
+                    hospital_name: hospital.hospital_name,
+                    coordinates: {
+                        lng: coordinates[0],
+                        lat: coordinates[1]
+                    },
+                    drug_info: {
+                        drug_id: drug._id,
+                        generic_name: drug.generic_name,
+                        trade_name: drug.trade_name,
+                        category: drug.category
+                    },
+                    details: {
+                        lot_number: lot.lot_number,
+                        expiry_date: lot.expiry_date,
+                        quantity: lot.quantity_in_lot,
+                        alert_message: `⏳ เสี่ยงหมดอายุ: ล็อต ${lot.lot_number} จำนวน ${lot.quantity_in_lot} ชิ้น จะหมดอายุในวันที่ ${new Date(lot.expiry_date).toLocaleDateString('th-TH')}`
+                    }
+                });
+            }
+        }
+
+        return res.status(200).json({
+            success: true,
+            count: mapMarkers.length,
+            data: mapMarkers
+        });
+
+    } catch (error) {
+        console.error('❌ AI Map Analytics error:', error);
+        return res.status(500).json({ success: false, message: 'Server Error' });
+    }
+};
+
+// =========================================================================
+// @desc    ค้นหายาฉุกเฉิน Real-Time บนแผนที่ (กรองอัตโนมัติจากโรงพยาบาลที่ผู้ใช้ Login)
+// @route   POST /api/ai/search-emergency
+// =========================================================================
+const searchEmergencyDrug = async (req, res) => {
+    try {
+        const { drug_id } = req.body;
+
+        if (!drug_id) {
+            return res.status(400).json({ success: false, message: 'โปรดระบุตัวยาที่ต้องการค้นหา' });
+        }
+
+        // 🧠 ดึงไอดีโรงพยาบาลอัตโนมัติจากระบบผู้ใช้ที่ Login อยู่ (req.user)
+        // แต่ทำ Fallback เผื่อใส่ใน req.body.from_hospital_id ไว้ให้ใช้ทดสอบใน Postman ช่วงแรกได้ครับ
+        const from_hospital_id = req.user?.hospital_id || req.user?.hospital?.objectId || req.body.from_hospital_id;
+
+        if (!from_hospital_id) {
+            return res.status(401).json({ 
+                success: false, 
+                message: 'ไม่พบข้อมูลโรงพยาบาลต้นทาง (โปรดตรวจสอบสถานะการ Login หรือส่ง from_hospital_id มาทดสอบ)' 
+            });
+        }
+
+        // 1. ดึงข้อมูลพิกัดของ รพ. ต้นทาง (ผู้ใช้ที่กำลังใช้งานระบบ)
+        const Hospital = require('../models/Hospital');
+        const sourceHospital = await Hospital.findById(from_hospital_id);
+        if (!sourceHospital) return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลโรงพยาบาลต้นทางในระบบ' });
+
+        const [srcLong, srcLat] = sourceHospital.location.coordinates;
+
+        // 2. ค้นหา รพ. อื่น ๆ ในระบบที่มีสต็อกยาตัวนี้ และมียาเหลือเฟือพร้อมปล่อยยืม (> Safety Stock)
+        const allInventory = await Inventory.find({ drug_ref: drug_id })
+            .populate('hospital_ref')
+            .populate('drug_ref');
+
+        const candidates = allInventory.filter(item =>
+            item.hospital_ref &&
+            item.hospital_ref._id.toString() !== from_hospital_id.toString() &&
+            item.available_quantity > item.safety_stock_level
+        );
+
+        // 🚚 เรียก Longdo Route API หาระยะทาง+เวลาขนส่งจริงตามถนน (ไม่ใช่เส้นตรง Haversine) แบบ parallel
+        // ทุก รพ. ที่มียาเหลือ เพื่อความเร็วในเคสฉุกเฉิน — ถ้า Longdo เรียกไม่สำเร็จราย รพ. ใด จะ fallback
+        // เป็นค่าประมาณ Haversine เฉพาะรายนั้น (ดู calculateRealRoute)
+        const searchResults = (await Promise.all(
+            candidates.map(async (item) => {
+                const donorHosp = item.hospital_ref;
+                const [donorLong, donorLat] = donorHosp.location.coordinates;
+
+                const route = await calculateRealRoute(srcLat, srcLong, donorLat, donorLong);
+
+                return {
+                    inventory_id: item._id,
+                    hospital_id: donorHosp._id,
+                    hospital_name: donorHosp.hospital_name,
+                    coordinates: { lng: donorLong, lat: donorLat },
+                    available_quantity: item.available_quantity,
+                    distance_km: route.distanceKm,
+                    estimated_time_minutes: route.minutes, // ส่งเวลาขนส่ง (นาที) ไปพล็อตเส้นทางบนแมพ
+                    is_estimate: route.isEstimate, // true = Longdo เรียกไม่สำเร็จ ใช้ค่าประมาณแทน
+                    network_zone: donorHosp.network_group_id
+                };
+            })
+        ))
+            // เคสฉุกเฉินเน้น "ความเร็วสูงสุด" ดึง รพ. ที่ใช้เวลาขนส่งน้อยที่สุดขึ้นก่อน
+            .sort((a, b) => a.estimated_time_minutes - b.estimated_time_minutes);
+
+        return res.status(200).json({ 
+            success: true, 
+            from_hospital_name: sourceHospital.hospital_name,
+            count: searchResults.length, 
+            data: searchResults 
+        });
+
+    } catch (error) {
+        console.error('❌ Search Emergency Drug Error:', error);
+        return res.status(500).json({ success: false, message: 'Server Error' });
+    }
+};
+
+// อัปเดตการ exports ส่งออกฟังก์ชันตัวใหม่ด้วยครับ
 module.exports = {
-    getAlertQueue
+    getAlertQueue,
+    getExpiryRedistribution,
+    getMapAnalytics,
+    searchEmergencyDrug
 };
