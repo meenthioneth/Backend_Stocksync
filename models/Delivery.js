@@ -29,8 +29,8 @@ const DeliverySchema = new mongoose.Schema({
     }, // ค่า ETA ประมวลผลจากภายนอก
     delivery_status: { 
         type: String, 
-        enum: ['DISPATCHED', 'EN_ROUTE', 'DELIVERED', 'FAILED'], 
-        default: 'DISPATCHED' 
+        enum: ['PREPARING', 'DISPATCHED', 'EN_ROUTE', 'DELIVERED', 'FAILED'], 
+        default: 'PREPARING' 
     },
     
     received_by: { 

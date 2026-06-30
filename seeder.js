@@ -1,14 +1,13 @@
 const mongoose = require('mongoose');
 const dotenv = require('dotenv');
 
-// ⚙️ โหลดโมเดลทั้งหมดมาทำงานพร้อมกัน
+// โหลดโมเดลทั้งหมดมาทำงานร่วมกัน
 const Inventory = require('./models/Inventory');
 const TransferRequest = require('./models/TransferRequest');
-const DrugUsageRate = require('./models/DrugUsageRate'); // 🌟 โหลดโมเดลใหม่ที่เพิ่งสร้าง
+const DrugUsageRate = require('./models/DrugUsageRate');
 
 dotenv.config();
 
-// ข้อมูลดิบจากไฟล์ระบบจริงของคุณ
 const hospitals = [
     { id: "6a2d572f841af787a2121ff4", name: "รพ.อุดรธานี (รพ.ศูนย์)", type: "A" },
     { id: "6a2d5730841af787a2121ff5", name: "รพ.กุมภวาปี", type: "F1" },
@@ -36,12 +35,6 @@ const drugs = [
     { id: "6a2d5730841af787a2122008", name: "Insulin Human", condition: "Cold Chain 2-8°C" }
 ];
 
-const users = [
-    "6a3a77ba4213259fce45e68e", "6a3a77ba4213259fce45e68f",
-    "6a3a77ba4213259fce45e692", "6a3a77ba4213259fce45e696",
-    "6a3a77ba4213259fce45e69e", "6a3a77ba4213259fce45e6a2"
-];
-
 const getRandomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 
 const seedDatabase = async () => {
@@ -49,35 +42,39 @@ const seedDatabase = async () => {
         await mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/stocksync');
         console.log('🔌 Connected to MongoDB...');
 
-        // ล้างข้อมูลเก่าของทั้ง 3 ตาราง
         await Inventory.deleteMany();
         await DrugUsageRate.deleteMany();
         await TransferRequest.deleteMany();
-        console.log('🧹 Cleared old data...');
+        console.log('🧹 Cleared old data for reshaping...');
 
         const inventoryData = [];
         const usageRateData = [];
 
-        // ------------------------------------------
-        // 📈 LOOP 1: วนลูปสร้าง Inventory และ ตารางใหม่ DrugUsageRate ควบคู่กัน (รวม 90 รายการคู่)
-        // ------------------------------------------
+        // -------------------------------------------------------------
+        // LOOP 1: เจนสถิติการใช้ยาและคลังสินค้าแบบกระจายตัวแปรครอบคลุม
+        // -------------------------------------------------------------
         hospitals.forEach((hosp) => {
             drugs.forEach((drug) => {
-                // 1. ส่วนคำนวณอัตราใช้ยา (DrugUsageRate)
+                
+                // 📊 1. ออกแบบข้อมูลความต้องการ (DrugUsageRate) ให้เฉลี่ยหลากหลาย
                 let avgUsage = 0;
                 let intensity = 'MEDIUM';
                 
                 if (hosp.type === "A") {
-                    avgUsage = getRandomInt(120, 240);
+                    avgUsage = getRandomInt(150, 250); // รพ. ศูนย์ (ยังคงเยอะสุดตามจริง)
                     intensity = 'HIGH';
-                } else if (["F1", "F2"].includes(hosp.type)) {
-                    avgUsage = getRandomInt(35, 85);
+                } else if (hosp.type === "F1") {
+                    avgUsage = getRandomInt(80, 140);  // รพ. อำเภอใหญ่ (มีโอกาสติดอันดับ AI Match แข่งกับ รพ.ศูนย์)
+                    intensity = 'HIGH';
+                } else if (hosp.type === "F2") {
+                    avgUsage = getRandomInt(30, 75);   // รพ. อำเภอกลาง
                     intensity = 'MEDIUM';
                 } else {
-                    avgUsage = getRandomInt(5, 20);
+                    avgUsage = getRandomInt(5, 25);    // รพ. อำเภอเล็ก
                     intensity = 'LOW';
                 }
-                const currentMonthUsage = Math.floor(avgUsage * (getRandomInt(50, 90) / 100));
+
+                const currentMonthUsage = Math.floor(avgUsage * (getRandomInt(60, 95) / 100));
 
                 usageRateData.push({
                     hospital_ref: hosp.id,
@@ -87,42 +84,66 @@ const seedDatabase = async () => {
                     demand_intensity: intensity
                 });
 
-                // 2. ส่วนคำนวณคลังสินค้า (Inventory)
-                let baseQty = Math.floor(avgUsage * getRandomInt(2, 4)); // ให้มีสต็อกเหลือพอใช้ 2-4 เดือน
-                const safetyStock = Math.floor(baseQty * 0.2);
-                const reserved = getRandomInt(0, 5);
-                const available = baseQty - reserved;
-
+                // 📦 2. ออกแบบคลังเวชภัณฑ์ (Inventory) ให้มีวันหมดอายุหลากหลายล็อตต่อตัวยา
+                // เพื่อให้มีทั้งล็อตวิกฤต ล็อตปานกลาง และล็อตปลอดภัย
+                let baseQty = 0;
                 const lots = [];
+
+                // ล็อต 1: ปลอดภัยสูง (หมดอายุอีก 18-24 เดือนข้างหน้า)
                 const normalExpiry = new Date();
-                normalExpiry.setMonth(normalExpiry.getMonth() + getRandomInt(12, 24));
-                
-                const nearExpiry = new Date();
-                nearExpiry.setMonth(nearExpiry.getMonth() + getRandomInt(1, 3)); // มีล็อตเสี่ยงหมดอายุ
-
-                const qtyLot1 = Math.floor(baseQty * 0.7);
-                const qtyLot2 = baseQty - qtyLot1;
-
+                normalExpiry.setMonth(normalExpiry.getMonth() + getRandomInt(18, 24));
+                const qtyNormal = getRandomInt(20, 100);
                 lots.push({
-                    lot_number: `LOT-${getRandomInt(66, 69)}${getRandomInt(1000, 9999)}`,
+                    lot_number: `LOT-NM-${getRandomInt(1000, 9999)}`,
                     expiry_date: normalExpiry,
-                    quantity_in_lot: qtyLot1
+                    quantity_in_lot: qtyNormal
                 });
+                baseQty += qtyNormal;
 
-                if (qtyLot2 > 0) {
+                // ล็อต 2: ปานกลาง (หมดอายุอีก 5-6 เดือนข้างหน้า -> รอดเกณฑ์สแกน 90 วัน)
+                if (getRandomInt(1, 10) > 4) { // สุ่มให้เกิด 60% ของคลังสินค้าทั้งหมด
+                    const midExpiry = new Date();
+                    midExpiry.setMonth(midExpiry.getMonth() + getRandomInt(5, 6));
+                    const qtyMid = getRandomInt(15, 40);
+                    lots.push({
+                        lot_number: `LOT-MID-${getRandomInt(1000, 9999)}`,
+                        expiry_date: midExpiry,
+                        quantity_in_lot: qtyMid
+                    });
+                    baseQty += qtyMid;
+                }
+
+                // ล็อต 3: 🚨 วิกฤตใกล้หมดอายุ (หมดอายุภายใน 1-3 เดือนข้างหน้า -> ติดสแกน AI)
+                // สุ่มให้กระจายพุ่งกระจายตัวทั่วโรงพยาบาลต่างๆ
+                if (getRandomInt(1, 10) > 3) { // สุ่มให้เกิดในสัดส่วน 70% เพื่อเพิ่มจำนวนการแจ้งเตือนบนหน้าเว็บ
+                    const criticalExpiry = new Date();
+                    criticalExpiry.setMonth(criticalExpiry.getMonth() + getRandomInt(1, 2));
+                    criticalExpiry.setDate(criticalExpiry.getDate() + getRandomInt(1, 20));
+                    
+                    const qtyCritical = getRandomInt(10, 50);
                     lots.push({
                         lot_number: `LOT-EXP-${getRandomInt(1000, 9999)}`,
-                        expiry_date: nearExpiry,
-                        quantity_in_lot: qtyLot2
+                        expiry_date: criticalExpiry,
+                        quantity_in_lot: qtyCritical
                     });
+                    baseQty += qtyCritical;
+                }
+
+                // ตั้งเกณฑ์วิกฤตสต็อกยาขาด (Safety Stock)
+                const safetyStock = Math.floor(avgUsage * 0.4); 
+                
+                // สุ่มสร้างสถานะ "สต็อกขาดคลังฉุกเฉิน" สลับกันไปเพื่อให้ปักหมุดสีแดงได้ทั่วถึงบนแผนที่
+                let availableQty = baseQty;
+                if (getRandomInt(1, 10) > 7) { 
+                    availableQty = getRandomInt(1, Math.max(2, safetyStock - 1)); // จงใจทำให้ต่ำกว่าเกณฑ์ความปลอดภัย
                 }
 
                 inventoryData.push({
                     hospital_ref: hosp.id,
                     drug_ref: drug.id,
                     quantity: baseQty,
-                    available_quantity: available,
-                    reserved_quantity: reserved,
+                    available_quantity: availableQty,
+                    reserved_quantity: getRandomInt(0, 4),
                     safety_stock_level: safetyStock,
                     ward_location: getRandomInt(0, 1) === 1 ? "คลังยาหลักกลาง" : "ห้องจ่ายยาฉุกเฉิน ER",
                     storage_condition: drug.condition,
@@ -131,68 +152,13 @@ const seedDatabase = async () => {
             });
         });
 
-        // ------------------------------------------
-        // 📊 LOOP 2: วนลูปเจนประวัติใบยืมยาเดิม (TransferRequest) จำนวน 60 รายการย้อนหลัง
-        // ------------------------------------------
-        const transfersData = [];
-        const statuses = ['PENDING', 'APPROVED', 'IN_TRANSIT', 'COMPLETED', 'REJECTED', 'CANCELLED'];
-
-        for (let i = 0; i < 60; i++) {
-            const fromHosp = hospitals[getRandomInt(0, hospitals.length - 1)];
-            let toHosp = hospitals[getRandomInt(0, hospitals.length - 1)];
-            while (toHosp.id === fromHosp.id) {
-                toHosp = hospitals[getRandomInt(0, hospitals.length - 1)];
-            }
-
-            const randomDrug = drugs[getRandomInt(0, drugs.length - 1)];
-            const status = statuses[getRandomInt(0, statuses.length - 1)];
-            const qtyRequested = getRandomInt(5, 35);
-
-            let qtyApproved = 0;
-            let approvedBy = null;
-            let rejectionReason = '';
-            let returnStatus = 'PENDING';
-
-            if (['APPROVED', 'IN_TRANSIT', 'COMPLETED'].includes(status)) {
-                qtyApproved = getRandomInt(0, 1) === 1 ? qtyRequested : qtyRequested - getRandomInt(1, 3);
-                approvedBy = users[getRandomInt(0, users.length - 1)];
-            }
-            if (status === 'REJECTED') rejectionReason = 'บุคลากรตรวจสอบแล้วไม่พบจำนวนคงเหลือที่สามารถแบ่งยืมได้';
-            if (status === 'COMPLETED' && getRandomInt(0, 1) === 1) returnStatus = 'RETURNED';
-
-            const createdDate = new Date();
-            createdDate.setDate(createdDate.getDate() - getRandomInt(1, 45));
-            const dueDate = new Date(createdDate);
-            dueDate.setDate(dueDate.getDate() + 30);
-
-            transfersData.push({
-                from_hospital: fromHosp.id,
-                to_hospital: toHosp.id,
-                drug_ref: randomDrug.id,
-                created_by: users[getRandomInt(0, users.length - 1)],
-                approved_by: approvedBy,
-                quantity_requested: qtyRequested,
-                quantity_approved: qtyApproved,
-                status: status,
-                return_due_date: dueDate,
-                return_status: returnStatus,
-                rejection_reason: rejectionReason,
-                createdAt: createdDate,
-                updatedAt: createdDate
-            });
-        }
-
-        // เซฟข้อมูลทั้งหมดเข้าสู่ฐานข้อมูลแยกตาราง
+        // บันทึกทั้งหมดลงใน Database
         await Inventory.insertMany(inventoryData);
-        console.log(`📦 1. เจนข้อมูลคลังยา (Inventory) สำเร็จ: ${inventoryData.length} รายการ`);
-
         await DrugUsageRate.insertMany(usageRateData);
-        console.log(`📈 2. เจนข้อมูลโมเดลใหม่ อัตราการใช้ยา (DrugUsageRate) สำเร็จ: ${usageRateData.length} รายการ`);
 
-        await TransferRequest.insertMany(transfersData);
-        console.log(`✅ 3. เจนสุ่มประวัติใบคำขอยืมยาเดิม (TransferRequest) สำเร็จ: ${transfersData.length} รายการย้อนหลัง`);
-
-        console.log('🎉 [StockSync] All 3 Tables Seeded and Sync Process Finished Successfully!');
+        console.log(`📦 Reshaped Inventory Count: ${inventoryData.length} records populated.`);
+        console.log(`📈 Reshaped Drug Usage Rates Count: ${usageRateData.length} records populated.`);
+        console.log('🎉 [Data Distributed Successfully] ทดสอบยิง API ระบบสแกนและจัดกลุ่ม AI ได้เลยครับ!');
         process.exit();
     } catch (error) {
         console.error('❌ Seeding failed:', error);
