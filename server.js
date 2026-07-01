@@ -9,6 +9,7 @@ require('./models/Drug');
 require('./models/Inventory');
 require('./models/TransferRequest');
 require('./models/Delivery');
+require('./models/BloodInventory');
 
 const app = express();
 
